@@ -53,30 +53,6 @@ def generate_multiple_videos(pipe, input_video, prompt, negative_prompt, cam_tra
 
     gaussians = predictions["splats"]
 
-    # -------- 新增代码: 保存高斯体为 PLY 文件 --------
-    # 为了防止影响原有流程，我们可以将高斯点云保存到 outputs 文件夹下
-    gs_save_dir = os.path.join(os.path.dirname(output_path), "gs_plys")
-    os.makedirs(gs_save_dir, exist_ok=True)
-
-    # 遍历 batch (通常 batch=1) 和每一帧
-    for b_idx in range(len(gaussians)):
-        for t_idx in range(len(gaussians[b_idx])):
-            cur_gaussian = gaussians[b_idx][t_idx]
-            if cur_gaussian.means.shape[0] == 0:
-                continue
-
-            ply_path = Path(gs_save_dir) / f"frame_{t_idx:04d}.ply"
-            save_gs_ply(
-                path=ply_path,
-                means=cur_gaussian.means,
-                scales=cur_gaussian.scales,
-                rotations=cur_gaussian.rotations,
-                rgbs=cur_gaussian.harmonics, # 将 SH 颜色作为 RGB 传入保存
-                opacities=cur_gaussian.opacities
-            )
-            print(f"Saved Gaussian splats to {ply_path}")
-    # ------------------------------------------------
-
     K_orig = predictions["rendered_intrinsics"][0]
     input_cam2world = predictions["rendered_extrinsics"][0]
     timestamps_orig = predictions["rendered_timestamps"][0]
