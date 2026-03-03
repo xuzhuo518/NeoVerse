@@ -6,11 +6,26 @@ from torchvision.transforms import functional as F
 from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline
 from diffsynth import save_video
 from diffsynth.utils.auxiliary import CameraTrajectory, load_video, homo_matrix_inverse
+from PIL import Image
 
+from pathlib import Path
+from diffsynth.auxiliary_models.worldmirror.utils.save_utils import save_gs_ply
+
+def concat_pil_images_horizontal(img_list):
+    """将多个 PIL Image 横向并排拼接"""
+    widths, heights = zip(*(i.size for i in img_list))
+    total_width = sum(widths)
+    max_height = max(heights)
+    new_im = Image.new('RGB', (total_width, max_height))
+    x_offset = 0
+    for im in img_list:
+        new_im.paste(im, (x_offset, 0))
+        x_offset += im.size[0]
+    return new_im
 
 @torch.no_grad()
-def generate_video(pipe, input_video, prompt, negative_prompt, cam_traj: CameraTrajectory,
-                   output_path="outputs/output.mp4", alpha_threshold=1.0, static_flag=False,
+def generate_multiple_videos(pipe, input_video, prompt, negative_prompt, cam_traj_list,
+                   output_paths, alpha_threshold=1.0, static_flag=False,
                    seed=42, cfg_scale=1.0, num_inference_steps=4):
     device = pipe.device
     height, width = input_video[0].size[1], input_video[0].size[0]
@@ -25,66 +40,167 @@ def generate_video(pipe, input_video, prompt, negative_prompt, cam_traj: CameraT
         views["is_static"] = torch.zeros((1, len(input_video)), dtype=torch.bool, device=device)
         views["timestamp"] = torch.arange(0, len(input_video), dtype=torch.int64, device=device).unsqueeze(0)
 
-    # Low-VRAM: load reconstructor to GPU before use
+    # ================= 阶段 1：只执行一次 4DGS 重建 =================
     if pipe.vram_management_enabled:
         pipe.reconstructor.to(device)
 
     with torch.amp.autocast("cuda", dtype=pipe.torch_dtype):
         predictions = pipe.reconstructor(views, is_inference=True, use_motion=False)
 
-    # Low-VRAM: offload reconstructor back to CPU
     if pipe.vram_management_enabled:
         pipe.reconstructor.cpu()
         torch.cuda.empty_cache()
 
     gaussians = predictions["splats"]
-    K = predictions["rendered_intrinsics"][0]
+
+    # -------- 新增代码: 保存高斯体为 PLY 文件 --------
+    # 为了防止影响原有流程，我们可以将高斯点云保存到 outputs 文件夹下
+    gs_save_dir = os.path.join(os.path.dirname(output_path), "gs_plys")
+    os.makedirs(gs_save_dir, exist_ok=True)
+
+    # 遍历 batch (通常 batch=1) 和每一帧
+    for b_idx in range(len(gaussians)):
+        for t_idx in range(len(gaussians[b_idx])):
+            cur_gaussian = gaussians[b_idx][t_idx]
+            if cur_gaussian.means.shape[0] == 0:
+                continue
+
+            ply_path = Path(gs_save_dir) / f"frame_{t_idx:04d}.ply"
+            save_gs_ply(
+                path=ply_path,
+                means=cur_gaussian.means,
+                scales=cur_gaussian.scales,
+                rotations=cur_gaussian.rotations,
+                rgbs=cur_gaussian.harmonics, # 将 SH 颜色作为 RGB 传入保存
+                opacities=cur_gaussian.opacities
+            )
+            print(f"Saved Gaussian splats to {ply_path}")
+    # ------------------------------------------------
+
+    K_orig = predictions["rendered_intrinsics"][0]
     input_cam2world = predictions["rendered_extrinsics"][0]
-    timestamps = predictions["rendered_timestamps"][0]
+    timestamps_orig = predictions["rendered_timestamps"][0]
 
-    if static_flag:
-        K = K[:1].repeat(len(cam_traj), 1, 1)
-        timestamps = timestamps[:1].repeat(len(cam_traj))
+    all_generated_seqs = []
+    all_depth_seqs = []
+    all_rgb_seqs = []
 
-    # Apply per-trajectory zoom_ratio
-    ratio = torch.linspace(1, cam_traj.zoom_ratio, K.shape[0], device=device)
-    K_zoomed = K.clone()
-    K_zoomed[:, 0, 0] *= ratio
-    K_zoomed[:, 1, 1] *= ratio
+    # ================= 阶段 2：针对每个视角轨迹循环渲染与 Diffusion =================
+    for idx, cam_traj in enumerate(cam_traj_list):
+        output_path = output_paths[idx]
+        print(f"\n---> 开始生成第 {idx + 1}/{len(cam_traj_list)} 个视角，保存至: {output_path}")
+        
+        K = K_orig.clone()
+        timestamps = timestamps_orig.clone()
 
-    target_cam2world = cam_traj.c2w.to(device)
-    if cam_traj.mode == "relative" and not static_flag:
-        target_cam2world = input_cam2world @ target_cam2world
-    target_world2cam = homo_matrix_inverse(target_cam2world)
-    target_rgb, target_depth, target_alpha = pipe.reconstructor.gs_renderer.rasterizer.forward(
-        gaussians,
-        render_viewmats=[target_world2cam],
-        render_Ks=[K_zoomed],
-        render_timestamps=[timestamps],
-        sh_degree=0, width=width, height=height,
+        if static_flag:
+            K = K[:1].repeat(len(cam_traj), 1, 1)
+            timestamps = timestamps[:1].repeat(len(cam_traj))
+
+        # 处理镜头缩放
+        ratio = torch.linspace(1, cam_traj.zoom_ratio, K.shape[0], device=device)
+        K_zoomed = K.clone()
+        K_zoomed[:, 0, 0] *= ratio
+        K_zoomed[:, 1, 1] *= ratio
+
+        # 获取目标相机位姿
+        target_cam2world = cam_traj.c2w.to(device)
+        if cam_traj.mode == "relative" and not static_flag:
+            target_cam2world = input_cam2world @ target_cam2world
+        
+        target_world2cam = homo_matrix_inverse(target_cam2world)
+        
+        # GS 渲染（Rasterization）
+        target_rgb, target_depth, target_alpha = pipe.reconstructor.gs_renderer.rasterizer.forward(
+            gaussians,
+            render_viewmats=[target_world2cam],
+            render_Ks=[K_zoomed],
+            render_timestamps=[timestamps],
+            sh_degree=0, width=width, height=height,
+        )
+        target_mask = (target_alpha > alpha_threshold).float()
+        
+        # 兼容 cam_traj 的可选属性
+        if getattr(cam_traj, "use_first_frame", False):
+            target_rgb[0, 0] = views["img"][0, 0].permute(1, 2, 0)
+            target_mask[0, 0] = 1.0
+            
+        wrapped_data = {
+            "source_views": views,
+            "target_rgb": target_rgb,
+            "target_depth": target_depth,
+            "target_mask": target_mask,
+            "target_poses": target_cam2world.unsqueeze(0),
+            "target_intrs": K_zoomed.unsqueeze(0),
+        }
+        
+        # Diffusion 模型生成
+        generated_frames = pipe(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            seed=seed, rand_device=pipe.device,
+            height=height, width=width, num_frames=len(target_cam2world),
+            cfg_scale=cfg_scale, num_inference_steps=num_inference_steps, tiled=False,
+            **wrapped_data,
+        )
+        all_generated_seqs.append(generated_frames)
+        
+        # 2. 深度图提取
+        depth_seq = target_depth[0].permute(0, 3, 1, 2)
+        depth_seq_3ch = depth_seq.repeat(1, 3, 1, 1) 
+        d_min, d_max = depth_seq_3ch.min(), depth_seq_3ch.max()
+        depth_norm = (depth_seq_3ch - d_min) / (d_max - d_min + 1e-6)
+        depth_uint8 = (depth_norm * 255).clamp(0, 255).to(torch.uint8).cpu()
+        depth_frames = [F.to_pil_image(frame) for frame in depth_uint8]
+        all_depth_seqs.append(depth_frames)
+
+        # 3. Target RGB 提取 (4DGS 原生渲染, 形状 [B, T, H, W, 3])
+        # 转换为 [T, 3, H, W] 并转为 uint8
+        rgb_seq = target_rgb[0].permute(0, 3, 1, 2)
+        rgb_uint8 = (rgb_seq * 255).clamp(0, 255).to(torch.uint8).cpu()
+        rgb_frames = [F.to_pil_image(frame) for frame in rgb_uint8]
+        all_rgb_seqs.append(rgb_frames)
+
+        # 释放每轮生成的显存
+        del generated_frames, wrapped_data, target_rgb, target_depth, target_alpha
+        torch.cuda.empty_cache()
+
+    # ================= 阶段 3：合并多视角视频帧 =================
+    print("\n---> 正在合并多个视角的视频...")
+    T = min(
+        len(all_generated_seqs[0]), 
+        len(all_depth_seqs[0]), 
+        len(all_rgb_seqs[0])
     )
-    target_mask = (target_alpha > alpha_threshold).float()
-    if cam_traj.use_first_frame:
-        target_rgb[0, 0] = views["img"][0, 0].permute(1, 2, 0)
-        target_mask[0, 0] = 1.0
-    wrapped_data = {
-        "source_views": views,
-        "target_rgb": target_rgb,
-        "target_depth": target_depth,
-        "target_mask": target_mask,
-        "target_poses": target_cam2world.unsqueeze(0),
-        "target_intrs": K_zoomed.unsqueeze(0),
-    }
-    generated_frames = pipe(
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        seed=seed, rand_device=pipe.device,
-        height=height, width=width, num_frames=len(target_cam2world),
-        cfg_scale=cfg_scale, num_inference_steps=num_inference_steps, tiled=False,
-        **wrapped_data,
-    )
-    save_video(generated_frames, output_path, fps=16)
+    merged_generated_frames = []
+    merged_depth_frames = []
+    merged_rgb_frames = []
 
+    for t in range(T):
+        # 取出所有视角在 t 时刻的帧，并横向拼接
+        gen_t = [seq[t] for seq in all_generated_seqs]
+        merged_generated_frames.append(concat_pil_images_horizontal(gen_t))
+
+        depth_t = [seq[t] for seq in all_depth_seqs]
+        merged_depth_frames.append(concat_pil_images_horizontal(depth_t))
+
+        rgb_t = [seq[t] for seq in all_rgb_seqs]
+        merged_rgb_frames.append(concat_pil_images_horizontal(rgb_t))
+
+    # ================= 阶段 4：保存合并结果 =================
+    base_path, ext = os.path.splitext(output_path)
+    out_gen = f"{base_path}_merged_diffusion{ext}"
+    out_depth = f"{base_path}_merged_depth{ext}"
+    out_rgb = f"{base_path}_merged_target_rgb{ext}"
+
+    save_video(merged_generated_frames, out_gen, fps=16)
+    print(f"  [完成] 视角合并后的 Diffusion 视频已保存至: {out_gen}")
+
+    save_video(merged_depth_frames, out_depth, fps=16)
+    print(f"  [完成] 视角合并后的 深度图(Depth) 视频已保存至: {out_depth}")
+
+    save_video(merged_rgb_frames, out_rgb, fps=16)
+    print(f"  [完成] 视角合并后的 Target RGB 视频已保存至: {out_rgb}")
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -93,13 +209,13 @@ def parse_args():
 
     # Trajectory specification (mutually exclusive)
     traj_group = parser.add_mutually_exclusive_group(required=True)
-    traj_group.add_argument("--trajectory",
+    traj_group.add_argument("--trajectory", nargs='+',
                             choices=["pan_left", "pan_right", "tilt_up", "tilt_down",
                                      "move_left", "move_right", "push_in", "pull_out",
                                      "boom_up", "boom_down", "orbit_left", "orbit_right",
                                      "static"],
                             help="Predefined trajectory type")
-    traj_group.add_argument("--trajectory_file",
+    traj_group.add_argument("--trajectory_file", nargs='+',
                             help="Path to JSON trajectory file")
 
     # Predefined trajectory parameters
@@ -154,8 +270,6 @@ def parse_args():
                         help="Enable static scene mode")
     parser.add_argument("--vis_rendering", action="store_true",
                         help="Save intermediate rendering visualizations")
-    parser.add_argument("--low_vram", action="store_true",
-                        help="Enable low-VRAM mode with model offloading (reduces peak VRAM usage)")
 
     return parser.parse_args()
 
@@ -200,19 +314,31 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    # Build trajectory
+    # Build trajectories list
+    cam_traj_list = []
+    output_paths = []
+    base_output, ext = os.path.splitext(args.output_path)
+
     if args.trajectory:
-        cam_traj = CameraTrajectory.from_predefined(
-            args.trajectory,
-            num_frames=args.num_frames,
-            mode=args.traj_mode,
-            angle=args.angle,
-            distance=args.distance,
-            orbit_radius=args.orbit_radius,
-            zoom_ratio=args.zoom_ratio,
-        )
+        for t_name in args.trajectory:
+            cam_traj = CameraTrajectory.from_predefined(
+                t_name,
+                num_frames=args.num_frames,
+                mode=args.traj_mode,
+                angle=args.angle,
+                distance=args.distance,
+                orbit_radius=args.orbit_radius,
+                zoom_ratio=args.zoom_ratio,
+            )
+            cam_traj_list.append(cam_traj)
+            output_paths.append(f"{base_output}_{t_name}{ext}")
     else:
-        cam_traj = CameraTrajectory.from_json(args.trajectory_file)
+        for t_file in args.trajectory_file:
+            cam_traj = CameraTrajectory.from_json(t_file)
+            cam_traj_list.append(cam_traj)
+            # 使用json文件名作为后缀    
+            file_name = os.path.splitext(os.path.basename(t_file))[0]
+            output_paths.append(f"{base_output}_{file_name}{ext}")
 
     # Load model
     print(f"Loading model from {args.model_path}...")
@@ -221,10 +347,8 @@ def main():
         reconstructor_path=args.reconstructor_path,
         lora_path=lora_path,
         lora_alpha=1.0,
-        device="cuda",
         torch_dtype=torch.bfloat16,
-        enable_vram_management=args.low_vram,
-    )
+    ).to("cuda")
     print("Model loaded!")
 
     # Load video
@@ -245,13 +369,13 @@ def main():
         pipe.save_root = vis_dir
 
     print(f"Generating with trajectory: {cam_traj.name} (mode={cam_traj.mode})")
-    generate_video(
+    generate_multiple_videos(
         pipe=pipe,
         input_video=images,
         prompt=args.prompt,
         negative_prompt=args.negative_prompt,
-        cam_traj=cam_traj,
-        output_path=output_path,
+        cam_traj_list=cam_traj_list,
+        output_paths=output_paths, # 传入多个保存路径
         alpha_threshold=args.alpha_threshold,
         static_flag=args.static_scene,
         seed=args.seed,
