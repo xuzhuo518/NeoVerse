@@ -11,6 +11,37 @@ from PIL import Image
 from pathlib import Path
 from diffsynth.auxiliary_models.worldmirror.utils.save_utils import save_gs_ply
 
+import cv2
+
+# ================= 新增：快速二进制 PLY 保存函数 =================
+def save_ply_binary(points, colors, filename):
+    """高效保存点云为二进制 PLY 文件"""
+    header = f"""ply
+format binary_little_endian 1.0
+element vertex {len(points)}
+property float x
+property float y
+property float z
+property uchar red
+property uchar green
+property uchar blue
+end_header
+"""
+    with open(filename, 'wb') as f:
+        f.write(header.encode('ascii'))
+        vertex_data = np.empty(len(points), dtype=[
+            ('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
+            ('r', 'u1'), ('g', 'u1'), ('b', 'u1')
+        ])
+        vertex_data['x'] = points[:, 0]
+        vertex_data['y'] = points[:, 1]
+        vertex_data['z'] = points[:, 2]
+        vertex_data['r'] = colors[:, 0]
+        vertex_data['g'] = colors[:, 1]
+        vertex_data['b'] = colors[:, 2]
+        f.write(vertex_data.tobytes())
+# =============================================================
+
 def concat_pil_images_horizontal(img_list):
     """将多个 PIL Image 横向并排拼接"""
     widths, heights = zip(*(i.size for i in img_list))
@@ -64,6 +95,7 @@ def generate_multiple_videos(pipe, input_video, prompt, negative_prompt, cam_tra
     # ================= 阶段 2：针对每个视角轨迹循环渲染与 Diffusion =================
     for idx, cam_traj in enumerate(cam_traj_list):
         output_path = output_paths[idx]
+        base_path_idx, ext_idx = os.path.splitext(output_path)
         print(f"\n---> 开始生成第 {idx + 1}/{len(cam_traj_list)} 个视角，保存至: {output_path}")
         
         K = K_orig.clone()
@@ -100,7 +132,56 @@ def generate_multiple_videos(pipe, input_video, prompt, negative_prompt, cam_tra
         if getattr(cam_traj, "use_first_frame", False):
             target_rgb[0, 0] = views["img"][0, 0].permute(1, 2, 0)
             target_mask[0, 0] = 1.0
+        
+        # ================= 新增：RGB-D 投影到点云 (叠帧效果) =================
+        print(f"  ---> 正在提取并生成叠帧点云...")
+        accumulated_pts = []
+        accumulated_colors = []
+        
+        T_frames = target_rgb.shape[1]
+        # 创建像素网格 (uv)
+        v, u = torch.meshgrid(torch.arange(height, device=device), 
+                              torch.arange(width, device=device), indexing='ij')
+        
+        for t in range(T_frames):
+            rgb_t = target_rgb[0, t]            # [H, W, 3]
+            depth_t = target_depth[0, t, ..., 0] # [H, W]
+            mask_t = target_mask[0, t, ..., 0]   # [H, W]
+            K_t = K_zoomed[t]                    # [3, 3]
+            c2w_t = target_cam2world[t]          # [4, 4]
             
+            fx, fy = K_t[0, 0], K_t[1, 1]
+            cx, cy = K_t[0, 2], K_t[1, 2]
+            
+            # 反投影到相机坐标系 (Camera coordinates)
+            x_c = (u - cx) * depth_t / fx
+            y_c = (v - cy) * depth_t / fy
+            z_c = depth_t
+            
+            pts_cam = torch.stack([x_c, y_c, z_c], dim=-1) # [H, W, 3]
+            
+            # 过滤背景（基于 Alpha Mask 和最小深度）
+            valid = (depth_t > 0.01) & (mask_t > 0.5)
+            pts_cam_valid = pts_cam[valid] # [N, 3]
+            colors_valid = rgb_t[valid]    # [N, 3]
+            
+            if pts_cam_valid.shape[0] > 0:
+                # 转换到世界坐标系 (World coordinates)
+                pts_cam_homo = torch.cat([pts_cam_valid, torch.ones_like(pts_cam_valid[..., :1])], dim=-1)
+                pts_world = (c2w_t @ pts_cam_homo.T).T[:, :3]
+                
+                accumulated_pts.append(pts_world.cpu().numpy())
+                accumulated_colors.append(colors_valid.cpu().numpy())
+
+        if accumulated_pts:
+            merged_pts = np.concatenate(accumulated_pts, axis=0)
+            merged_cols = (np.concatenate(accumulated_colors, axis=0) * 255).clip(0, 255).astype(np.uint8)
+            
+            pc_out_path = f"{base_path_idx}_stacked_pc.ply"
+            save_ply_binary(merged_pts, merged_cols, pc_out_path)
+            print(f"  [完成] 当前轨迹的叠帧点云已保存至: {pc_out_path} (总点数: {len(merged_pts)})")
+        # =============================================================
+
         wrapped_data = {
             "source_views": views,
             "target_rgb": target_rgb,
@@ -138,19 +219,21 @@ def generate_multiple_videos(pipe, input_video, prompt, negative_prompt, cam_tra
         all_rgb_seqs.append(rgb_frames)
 
         # 释放每轮生成的显存
-        del generated_frames, wrapped_data, target_rgb, target_depth, target_alpha
+        del wrapped_data, target_rgb, target_depth, target_alpha
         torch.cuda.empty_cache()
 
     # ================= 阶段 3：合并多视角视频帧 =================
     print("\n---> 正在合并多个视角的视频...")
     T = min(
-        len(all_generated_seqs[0]), 
+        # len(all_generated_seqs[0]), 
         len(all_depth_seqs[0]), 
         len(all_rgb_seqs[0])
     )
     merged_generated_frames = []
     merged_depth_frames = []
     merged_rgb_frames = []
+    alignment_checks = []
+    edge_checks = []
 
     for t in range(T):
         # 取出所有视角在 t 时刻的帧，并横向拼接
