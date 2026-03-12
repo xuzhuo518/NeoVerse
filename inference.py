@@ -2,448 +2,438 @@ import torch
 import os
 import argparse
 import numpy as np
+from PIL import Image
+from pathlib import Path
 from torchvision.transforms import functional as F
+from scipy.spatial.transform import Rotation
 from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline
 from diffsynth import save_video
 from diffsynth.utils.auxiliary import CameraTrajectory, load_video, homo_matrix_inverse
-from PIL import Image
+from diffsynth.utils.app import extract_point_cloud, build_scene_glb
+from diffsynth.auxiliary_models.depth_anything_3.utils.gsply_helpers import export_ply
 
-from pathlib import Path
-from diffsynth.auxiliary_models.worldmirror.utils.save_utils import save_gs_ply
+# ================= 核心新增：引入 Umeyama Sim(3) 对齐算法 =================
+from diffsynth.auxiliary_models.depth_anything_3.utils.pose_align import align_poses_umeyama
+# =======================================================================
 
-import cv2
+def transform_gaussians_sim3(gaussians, R, T, scale):
+    """
+    将 Gaussians 对象参数经过 Sim(3) 变换 (旋转R, 平移T, 缩放scale)。
+    """
+    if isinstance(gaussians, list):
+        return [transform_gaussians_sim3(g, R, T, scale) for g in gaussians]
 
-# ================= 新增：快速二进制 PLY 保存函数 =================
-def save_ply_binary(points, colors, filename):
-    """高效保存点云为二进制 PLY 文件"""
-    header = f"""ply
-format binary_little_endian 1.0
-element vertex {len(points)}
-property float x
-property float y
-property float z
-property uchar red
-property uchar green
-property uchar blue
-end_header
-"""
-    with open(filename, 'wb') as f:
-        f.write(header.encode('ascii'))
-        vertex_data = np.empty(len(points), dtype=[
-            ('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
-            ('r', 'u1'), ('g', 'u1'), ('b', 'u1')
-        ])
-        vertex_data['x'] = points[:, 0]
-        vertex_data['y'] = points[:, 1]
-        vertex_data['z'] = points[:, 2]
-        vertex_data['r'] = colors[:, 0]
-        vertex_data['g'] = colors[:, 1]
-        vertex_data['b'] = colors[:, 2]
-        f.write(vertex_data.tobytes())
-# =============================================================
+    device = R.device
 
-def concat_pil_images_horizontal(img_list):
-    """将多个 PIL Image 横向并排拼接"""
-    widths, heights = zip(*(i.size for i in img_list))
-    total_width = sum(widths)
-    max_height = max(heights)
-    new_im = Image.new('RGB', (total_width, max_height))
-    x_offset = 0
-    for im in img_list:
-        new_im.paste(im, (x_offset, 0))
-        x_offset += im.size[0]
-    return new_im
+    def quat_mult(q1, q2):
+        w1, x1, y1, z1 = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
+        w2, x2, y2, z2 = q2[..., 0], q2[..., 1], q2[..., 2], q2[..., 3]
+        return torch.stack([
+            w1*w2 - x1*x2 - y1*y2 - z1*z2,
+            w1*x2 + x1*w2 + y1*z2 - z1*y2,
+            w1*y2 - x1*z2 + y1*w2 + z1*x2,
+            w1*z2 + x1*y2 - y1*x2 + z1*w2
+        ], dim=-1)
+
+    R_np = R.detach().cpu().to(torch.float32).numpy()
+    rot = Rotation.from_matrix(R_np)
+    qx, qy, qz, qw = rot.as_quat()
+    q_c2w = torch.tensor([qw, qx, qy, qz], device=device, dtype=torch.float32)
+
+    kwargs = {}
+    for k, v in gaussians.__dict__.items():
+        if k == 'means':
+            # Sim(3) 作用于坐标: X_new = scale * (R @ X) + T
+            new_means = scale * torch.matmul(v, R.to(v.dtype).T) + T.to(v.dtype)
+            kwargs['means'] = new_means
+        elif k == 'scales':
+            # 缩放高斯体的物理尺寸
+            kwargs['scales'] = v * scale
+        elif k == 'rotations':
+            q_c2w_exp = q_c2w.unsqueeze(0).expand(v.shape[0], 4).to(v.dtype)
+            new_quats = quat_mult(q_c2w_exp, v)
+            new_quats = new_quats / new_quats.norm(dim=-1, keepdim=True)
+            kwargs['rotations'] = new_quats
+        elif isinstance(v, torch.Tensor):
+            kwargs[k] = v.clone()
+        else:
+            kwargs[k] = v
+
+    from diffsynth.auxiliary_models.worldmirror.models.models.rasterization import Gaussians
+    return Gaussians(**kwargs)
+
+def apply_sim3_to_poses(poses, R, T, s):
+    """
+    将 Sim(3) 变换应用于 Camera-to-World 轨迹
+    poses: [N, 4, 4]
+    """
+    out_poses = poses.clone()
+    # 旋转: R_new = R @ R_old
+    out_poses[:, :3, :3] = R @ poses[:, :3, :3]
+    # 平移: T_new = s * (R @ T_old) + T
+    out_poses[:, :3, 3] = s * (R @ poses[:, :3, 3].unsqueeze(-1)).squeeze(-1) + T
+    return out_poses
+
+def merge_and_filter_gaussians(gaussians_list, opacity_thresh=0.05, conf_thresh=0.0):
+    """
+    学习 Rasterizer 逻辑：对列表中的多个局部高斯体进行掩码过滤，并使用 torch.cat 合并为单一全局 Gaussians 对象。
+    """
+    if not gaussians_list:
+        return None
+    
+    filtered_means, filtered_scales, filtered_rots = [], [], []
+    filtered_harmonics, filtered_opacities, filtered_conf = [], [], []
+    
+    for gs in gaussians_list:
+        # 1. 过滤逻辑：参考 forward 中的阈值 Mask
+        mask = torch.ones_like(gs.opacities, dtype=torch.bool).squeeze(-1)
+        if opacity_thresh >= 0:
+            mask = mask & (gs.opacities.squeeze(-1) >= opacity_thresh)
+        if conf_thresh >= 0 and getattr(gs, "confidences", None) is not None:
+            mask = mask & (gs.confidences.squeeze(-1) > conf_thresh)
+            
+        if mask.sum() == 0:
+            continue
+            
+        # 提取当前局部高斯中符合条件的点
+        filtered_means.append(gs.means[mask])
+        filtered_scales.append(gs.scales[mask])
+        filtered_rots.append(gs.rotations[mask])
+        filtered_harmonics.append(gs.harmonics[mask])
+        filtered_opacities.append(gs.opacities[mask])
+        if getattr(gs, "confidences", None) is not None:
+            filtered_conf.append(gs.confidences[mask])
+            
+    if not filtered_means:
+        return None
+        
+    # 2. 拼接逻辑：参考 rasterize_splats 中的 torch.cat
+    from diffsynth.auxiliary_models.worldmirror.models.models.rasterization import Gaussians
+    
+    merged_gaussians = Gaussians(
+        means=torch.cat(filtered_means, dim=0),
+        scales=torch.cat(filtered_scales, dim=0),
+        rotations=torch.cat(filtered_rots, dim=0),
+        harmonics=torch.cat(filtered_harmonics, dim=0),
+        opacities=torch.cat(filtered_opacities, dim=0),
+        confidences=torch.cat(filtered_conf, dim=0) if filtered_conf else None,
+        timestamp=0 # 静态场景默认时间戳
+    )
+    
+    return merged_gaussians
+
+def save_single_gaussians_to_ply(merged_gaussians, out_path):
+    """
+    将单一的 Gaussians 对象直接导出为 PLY 格式文件。
+    """
+    if merged_gaussians is None or merged_gaussians.means.shape[0] == 0:
+        print("No Gaussians to export.")
+        return
+
+    # 全部转移至 CPU 并转换为 float32 以供导出
+    means = merged_gaussians.means.detach().cpu().float()
+    scales = merged_gaussians.scales.detach().cpu().float()
+    rotations = merged_gaussians.rotations.detach().cpu().float()
+    harmonics = merged_gaussians.harmonics.detach().cpu().float()
+    
+    # 调整球谐函数维度以适配导出脚本
+    if harmonics.ndim == 2:
+        harmonics = harmonics.unsqueeze(-1)
+    elif harmonics.ndim == 3 and harmonics.shape[2] != 1:
+        harmonics = harmonics.transpose(1, 2)
+        
+    opacities = merged_gaussians.opacities.detach().cpu().float()
+    # 3DGS 要求的逆 Sigmoid 转换
+    inv_op = torch.log(opacities / (1.0 - opacities + 1e-7))
+
+    from diffsynth.auxiliary_models.depth_anything_3.utils.gsply_helpers import export_ply
+    from pathlib import Path
+    
+    export_ply(
+        means=means, scales=scales,
+        rotations=rotations, harmonics=harmonics,
+        opacities=inv_op, path=Path(out_path),
+        shift_and_scale=False, save_sh_dc_only=True, match_3dgs_mcmc_dev=False
+    )
+    print(f"✅ Successfully exported optimized GLOBAL Gaussians to {out_path} (Total Points: {means.shape[0]})")
 
 @torch.no_grad()
-def generate_multiple_videos(pipe, input_video, prompt, negative_prompt, cam_traj_list,
-                   output_paths, alpha_threshold=1.0, static_flag=False,
-                   seed=42, cfg_scale=1.0, num_inference_steps=4):
+def generate_video(pipe, input_video, prompt, negative_prompt, cam_traj: CameraTrajectory,
+                   output_path="outputs/output.mp4", alpha_threshold=1.0, static_flag=False,
+                   seed=42, cfg_scale=1.0, num_inference_steps=4, num_iterations=1):
     device = pipe.device
     height, width = input_video[0].size[1], input_video[0].size[0]
-    views = {
-        "img": torch.stack([F.to_tensor(image)[None] for image in input_video], dim=1).to(device),
-        "is_target": torch.zeros((1, len(input_video)), dtype=torch.bool, device=device),
-    }
-    if static_flag:
-        views["is_static"] = torch.ones((1, len(input_video)), dtype=torch.bool, device=device)
-        views["timestamp"] = torch.zeros((1, len(input_video)), dtype=torch.int64, device=device)
-    else:
-        views["is_static"] = torch.zeros((1, len(input_video)), dtype=torch.bool, device=device)
-        views["timestamp"] = torch.arange(0, len(input_video), dtype=torch.int64, device=device).unsqueeze(0)
-
-    # ================= 阶段 1：只执行一次 4DGS 重建 =================
-    if pipe.vram_management_enabled:
-        pipe.reconstructor.to(device)
-
-    with torch.amp.autocast("cuda", dtype=pipe.torch_dtype):
-        predictions = pipe.reconstructor(views, is_inference=True, use_motion=False)
-
-    if pipe.vram_management_enabled:
-        pipe.reconstructor.cpu()
-        torch.cuda.empty_cache()
-
-    gaussians = predictions["splats"]
-
-    K_orig = predictions["rendered_intrinsics"][0]
-    input_cam2world = predictions["rendered_extrinsics"][0]
-    timestamps_orig = predictions["rendered_timestamps"][0]
-
-    all_generated_seqs = []
-    all_depth_seqs = []
-    all_rgb_seqs = []
-
-    # ================= 阶段 2：针对每个视角轨迹循环渲染与 Diffusion =================
-    for idx, cam_traj in enumerate(cam_traj_list):
-        output_path = output_paths[idx]
-        base_path_idx, ext_idx = os.path.splitext(output_path)
-        print(f"\n---> 开始生成第 {idx + 1}/{len(cam_traj_list)} 个视角，保存至: {output_path}")
+    
+    current_video = input_video
+    
+    # 用于记录前一次生成的真实全局位姿，作为当前局部重建轨迹的匹配参考
+    last_global_target_cam2world = None 
+    all_global_gaussians = [] 
+    global_time_offset = 0
+    base_output_path = output_path
+    name, ext = os.path.splitext(base_output_path)
+    all_generated_frames, all_combined_frames = [], []
+    
+    for it in range(num_iterations):
+        print(f"\n--- Iteration {it+1}/{num_iterations} ---")
+        current_static_flag = static_flag if it == 0 else False
         
-        K = K_orig.clone()
-        timestamps = timestamps_orig.clone()
+        views = {
+            "img": torch.stack([F.to_tensor(image)[None] for image in current_video], dim=1).to(device),
+            "is_target": torch.zeros((1, len(current_video)), dtype=torch.bool, device=device),
+        }
+        
+        if current_static_flag:
+            views["is_static"] = torch.ones((1, len(current_video)), dtype=torch.bool, device=device)
+            views["timestamp"] = torch.zeros((1, len(current_video)), dtype=torch.int64, device=device)
+        else:
+            views["is_static"] = torch.zeros((1, len(current_video)), dtype=torch.bool, device=device)
+            views["timestamp"] = torch.arange(
+                global_time_offset, 
+                global_time_offset + len(current_video), 
+                dtype=torch.int64, 
+                device=device
+            ).unsqueeze(0)
 
-        if static_flag:
-            K = K[:1].repeat(len(cam_traj), 1, 1)
-            timestamps = timestamps[:1].repeat(len(cam_traj))
+        if pipe.vram_management_enabled: pipe.reconstructor.to(device)
+        with torch.amp.autocast("cuda", dtype=pipe.torch_dtype):
+            predictions = pipe.reconstructor(views, is_inference=True, use_motion=False)
+        if pipe.vram_management_enabled:
+            pipe.reconstructor.cpu()
+            torch.cuda.empty_cache()
 
-        # 处理镜头缩放
+        local_gaussians = predictions["splats"] 
+        K = predictions["rendered_intrinsics"][0]
+        local_cam2world = predictions["rendered_extrinsics"][0]
+        timestamps = predictions["rendered_timestamps"][0]
+
+        if current_static_flag:
+            K = K[:1].repeat(len(cam_traj.c2w), 1, 1)
+            timestamps = timestamps[:1].repeat(len(cam_traj.c2w))
+
+        # ================= SE(3) 全局对齐 =================
+        if it == 0:
+            # 第一次迭代：定义局部坐标系为初始全局坐标系
+            R_tensor = torch.eye(3, device=device)
+            T_tensor = torch.zeros(3, device=device)
+            s_val = 1.0
+            current_transformed_gaussians = local_gaussians[0]
+        else:
+            c2w_ref = last_global_target_cam2world.detach().cpu().numpy().astype(np.float64)
+            c2w_est = local_cam2world.detach().cpu().numpy().astype(np.float64)
+            
+            # 【纯旋转模式】相机中心几乎不动，Umeyama 会退化。
+            # 策略：强制缩放 scale = 1.0，直接使用首帧的 SE(3) 相对位姿进行刚性对齐
+            # 计算相对位姿: M_align = c2w_ref @ c2w_est^-1
+            M_align = c2w_ref[0] @ np.linalg.inv(c2w_est[0])
+            
+            R_tensor = torch.tensor(M_align[:3, :3], device=device, dtype=torch.float32)
+            T_tensor = torch.tensor(M_align[:3, 3], device=device, dtype=torch.float32)
+            s_val = 1.0
+            current_transformed_gaussians = transform_gaussians_sim3(local_gaussians[0], R_tensor, T_tensor, s_val)
+        # ==========================================================
+            
+        all_global_gaussians.extend(current_transformed_gaussians)
+        
+        # 变焦缩放处理
         ratio = torch.linspace(1, cam_traj.zoom_ratio, K.shape[0], device=device)
         K_zoomed = K.clone()
-        K_zoomed[:, 0, 0] *= ratio
-        K_zoomed[:, 1, 1] *= ratio
+        if K_zoomed.shape[0] < cam_traj.c2w.shape[0]:
+            K_zoomed = torch.cat([K_zoomed, K_zoomed[-1:].repeat(cam_traj.c2w.shape[0] - K_zoomed.shape[0], 1, 1)], dim=0)
+        elif K_zoomed.shape[0] > cam_traj.c2w.shape[0]:
+            K_zoomed = K_zoomed[:cam_traj.c2w.shape[0]]
+        K_zoomed[:, 0, 0] *= ratio; K_zoomed[:, 1, 1] *= ratio
 
-        # 获取目标相机位姿
-        target_cam2world = cam_traj.c2w.to(device)
-        if cam_traj.mode == "relative" and not static_flag:
-            target_cam2world = input_cam2world @ target_cam2world
+        # 构建局部目标相机位姿
+        local_target_cam2world = cam_traj.c2w.to(device)
+        if cam_traj.mode == "relative" and not current_static_flag:
+            base_pose = local_cam2world[-1:] 
+            local_target_cam2world = base_pose @ local_target_cam2world
+
+        # 构建对应的全局目标位姿 (为下一次迭代的 Umeyama 对齐做准备)
+        global_target_cam2world = apply_sim3_to_poses(local_target_cam2world, R_tensor, T_tensor, s_val)
+        last_global_target_cam2world = global_target_cam2world.clone()
         
-        target_world2cam = homo_matrix_inverse(target_cam2world)
+        global_target_world2cam = homo_matrix_inverse(global_target_cam2world)
         
-        # GS 渲染（Rasterization）
+        ts = timestamps.clone()
+        if ts.shape[0] < global_target_world2cam.shape[0]:
+            ts = torch.cat([ts, ts[-1:].repeat(global_target_world2cam.shape[0] - ts.shape[0])], dim=0)
+        else:
+            ts = ts[:global_target_world2cam.shape[0]]
+
+        # 在统一尺度下渲染全局高斯
         target_rgb, target_depth, target_alpha = pipe.reconstructor.gs_renderer.rasterizer.forward(
-            gaussians,
-            render_viewmats=[target_world2cam],
+            [all_global_gaussians],
+            render_viewmats=[global_target_world2cam],
             render_Ks=[K_zoomed],
-            render_timestamps=[timestamps],
+            render_timestamps=[ts],
             sh_degree=0, width=width, height=height,
         )
+        
+
         target_mask = (target_alpha > alpha_threshold).float()
-        
-        # 兼容 cam_traj 的可选属性
-        if getattr(cam_traj, "use_first_frame", False):
-            target_rgb[0, 0] = views["img"][0, 0].permute(1, 2, 0)
+        if cam_traj.use_first_frame:
+            target_rgb[0, 0] = views["img"][0, -1].permute(1, 2, 0)
             target_mask[0, 0] = 1.0
-        
-        # ================= 新增：RGB-D 投影到点云 (叠帧效果) =================
-        print(f"  ---> 正在提取并生成叠帧点云...")
-        accumulated_pts = []
-        accumulated_colors = []
-        
-        T_frames = target_rgb.shape[1]
-        # 创建像素网格 (uv)
-        v, u = torch.meshgrid(torch.arange(height, device=device), 
-                              torch.arange(width, device=device), indexing='ij')
-        
-        for t in range(T_frames):
-            rgb_t = target_rgb[0, t]            # [H, W, 3]
-            depth_t = target_depth[0, t, ..., 0] # [H, W]
-            mask_t = target_mask[0, t, ..., 0]   # [H, W]
-            K_t = K_zoomed[t]                    # [3, 3]
-            c2w_t = target_cam2world[t]          # [4, 4]
             
-            fx, fy = K_t[0, 0], K_t[1, 1]
-            cx, cy = K_t[0, 2], K_t[1, 2]
-            
-            # 反投影到相机坐标系 (Camera coordinates)
-            x_c = (u - cx) * depth_t / fx
-            y_c = (v - cy) * depth_t / fy
-            z_c = depth_t
-            
-            pts_cam = torch.stack([x_c, y_c, z_c], dim=-1) # [H, W, 3]
-            
-            # 过滤背景（基于 Alpha Mask 和最小深度）
-            valid = (depth_t > 0.01) & (mask_t > 0.5)
-            pts_cam_valid = pts_cam[valid] # [N, 3]
-            colors_valid = rgb_t[valid]    # [N, 3]
-            
-            if pts_cam_valid.shape[0] > 0:
-                # 转换到世界坐标系 (World coordinates)
-                pts_cam_homo = torch.cat([pts_cam_valid, torch.ones_like(pts_cam_valid[..., :1])], dim=-1)
-                pts_world = (c2w_t @ pts_cam_homo.T).T[:, :3]
-                
-                accumulated_pts.append(pts_world.cpu().numpy())
-                accumulated_colors.append(colors_valid.cpu().numpy())
-
-        if accumulated_pts:
-            merged_pts = np.concatenate(accumulated_pts, axis=0)
-            merged_cols = (np.concatenate(accumulated_colors, axis=0) * 255).clip(0, 255).astype(np.uint8)
-            
-            pc_out_path = f"{base_path_idx}_stacked_pc.ply"
-            save_ply_binary(merged_pts, merged_cols, pc_out_path)
-            print(f"  [完成] 当前轨迹的叠帧点云已保存至: {pc_out_path} (总点数: {len(merged_pts)})")
-        # =============================================================
-
         wrapped_data = {
             "source_views": views,
             "target_rgb": target_rgb,
             "target_depth": target_depth,
             "target_mask": target_mask,
-            "target_poses": target_cam2world.unsqueeze(0),
+            "target_poses": local_target_cam2world.unsqueeze(0),
             "target_intrs": K_zoomed.unsqueeze(0),
         }
         
-        # Diffusion 模型生成
         generated_frames = pipe(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            seed=seed, rand_device=pipe.device,
-            height=height, width=width, num_frames=len(target_cam2world),
-            cfg_scale=cfg_scale, num_inference_steps=num_inference_steps, tiled=False,
-            **wrapped_data,
+            prompt=prompt, negative_prompt=negative_prompt, seed=seed + it, 
+            rand_device=pipe.device, height=height, width=width, num_frames=len(local_target_cam2world),
+            cfg_scale=cfg_scale, num_inference_steps=num_inference_steps, tiled=False, **wrapped_data,
         )
-        all_generated_seqs.append(generated_frames)
         
-        # 2. 深度图提取
-        depth_seq = target_depth[0].permute(0, 3, 1, 2)
-        depth_seq_3ch = depth_seq.repeat(1, 3, 1, 1) 
-        d_min, d_max = depth_seq_3ch.min(), depth_seq_3ch.max()
-        depth_norm = (depth_seq_3ch - d_min) / (d_max - d_min + 1e-6)
-        depth_uint8 = (depth_norm * 255).clamp(0, 255).to(torch.uint8).cpu()
-        depth_frames = [F.to_pil_image(frame) for frame in depth_uint8]
-        all_depth_seqs.append(depth_frames)
+        _target_rgb = target_rgb[0].detach().cpu().float().numpy()
+        _target_depth = target_depth[0].detach().cpu().float().numpy()
+        if _target_depth.ndim == 3: _target_depth = _target_depth[..., np.newaxis]
+            
+        _target_rgb = np.clip(_target_rgb * 255, 0, 255).astype(np.uint8)
+        d_min, d_max = _target_depth.min(), _target_depth.max()
+        if d_max > d_min: _target_depth = (_target_depth - d_min) / (d_max - d_min)
+        else: _target_depth = np.zeros_like(_target_depth)
+        _target_depth = np.clip(_target_depth * 255, 0, 255).astype(np.uint8)
+        
+        if _target_depth.shape[-1] == 1: _target_depth = np.repeat(_target_depth, 3, axis=-1)
+            
+        rgb_pil = [Image.fromarray(f) for f in _target_rgb]
+        depth_pil = [Image.fromarray(f) for f in _target_depth]
+        
+        combined_iter_frames = []
+        for r_img, d_img, g_img in zip(rgb_pil, depth_pil, generated_frames):
+            tw = r_img.width + d_img.width + g_img.width
+            th = max(r_img.height, d_img.height, g_img.height)
+            comb = Image.new('RGB', (tw, th))
+            comb.paste(r_img, (0, 0))
+            comb.paste(d_img, (r_img.width, 0))
+            comb.paste(g_img, (r_img.width + d_img.width, 0))
+            combined_iter_frames.append(comb)
+            
+        if it == 0:
+            all_generated_frames.extend(generated_frames)
+            all_combined_frames.extend(combined_iter_frames) 
+        else:
+            all_generated_frames.extend(generated_frames[1:])
+            all_combined_frames.extend(combined_iter_frames[1:])
 
-        # 3. Target RGB 提取 (4DGS 原生渲染, 形状 [B, T, H, W, 3])
-        # 转换为 [T, 3, H, W] 并转为 uint8
-        rgb_seq = target_rgb[0].permute(0, 3, 1, 2)
-        rgb_uint8 = (rgb_seq * 255).clamp(0, 255).to(torch.uint8).cpu()
-        rgb_frames = [F.to_pil_image(frame) for frame in rgb_uint8]
-        all_rgb_seqs.append(rgb_frames)
+        current_video = generated_frames
+        global_time_offset += len(current_video) - 1
 
-        # 释放每轮生成的显存
-        del wrapped_data, target_rgb, target_depth, target_alpha
-        torch.cuda.empty_cache()
+    final_output_path = f"{name}_full_concat{ext}"
+    save_video(all_generated_frames, final_output_path, fps=16)
+    print(f"\n>>> Saved fully concatenated continuous video to {final_output_path}")
+    
+    final_combined_path = f"{name}_full_combined{ext}"
+    save_video(all_combined_frames, final_combined_path, fps=16)
+    print(f">>> Saved fully concatenated combined video to {final_combined_path}")
 
-    # ================= 阶段 3：合并多视角视频帧 =================
-    print("\n---> 正在合并多个视角的视频...")
-    T = min(
-        # len(all_generated_seqs[0]), 
-        len(all_depth_seqs[0]), 
-        len(all_rgb_seqs[0])
+    print("\n>>> Optimizing and Merging global 3D Gaussians list...")
+    final_merged_gaussians = merge_and_filter_gaussians(
+        all_global_gaussians, 
+        opacity_thresh=0.05, 
+        conf_thresh=0.0
     )
-    merged_generated_frames = []
-    merged_depth_frames = []
-    merged_rgb_frames = []
-    alignment_checks = []
-    edge_checks = []
-
-    for t in range(T):
-        # 取出所有视角在 t 时刻的帧，并横向拼接
-        gen_t = [seq[t] for seq in all_generated_seqs]
-        merged_generated_frames.append(concat_pil_images_horizontal(gen_t))
-
-        depth_t = [seq[t] for seq in all_depth_seqs]
-        merged_depth_frames.append(concat_pil_images_horizontal(depth_t))
-
-        rgb_t = [seq[t] for seq in all_rgb_seqs]
-        merged_rgb_frames.append(concat_pil_images_horizontal(rgb_t))
-
-    # ================= 阶段 4：保存合并结果 =================
-    base_path, ext = os.path.splitext(output_path)
-    out_gen = f"{base_path}_merged_diffusion{ext}"
-    out_depth = f"{base_path}_merged_depth{ext}"
-    out_rgb = f"{base_path}_merged_target_rgb{ext}"
-
-    save_video(merged_generated_frames, out_gen, fps=16)
-    print(f"  [完成] 视角合并后的 Diffusion 视频已保存至: {out_gen}")
-
-    save_video(merged_depth_frames, out_depth, fps=16)
-    print(f"  [完成] 视角合并后的 深度图(Depth) 视频已保存至: {out_depth}")
-
-    save_video(merged_rgb_frames, out_rgb, fps=16)
-    print(f"  [完成] 视角合并后的 Target RGB 视频已保存至: {out_rgb}")
+    
+    global_ply_path = f"{name}_global_scene.ply"
+    print(f">>> Saving Merged Global 3D Gaussians to {global_ply_path}...")
+    
+    save_single_gaussians_to_ply(final_merged_gaussians, global_ply_path)
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="NeoVerse Unified Inference",
-    )
-
-    # Trajectory specification (mutually exclusive)
+    parser = argparse.ArgumentParser(description="NeoVerse Unified Inference")
     traj_group = parser.add_mutually_exclusive_group(required=True)
-    traj_group.add_argument("--trajectory", nargs='+',
-                            choices=["pan_left", "pan_right", "tilt_up", "tilt_down",
+    traj_group.add_argument("--trajectory", choices=["pan_left", "pan_right", "tilt_up", "tilt_down",
                                      "move_left", "move_right", "push_in", "pull_out",
-                                     "boom_up", "boom_down", "orbit_left", "orbit_right",
-                                     "static"],
-                            help="Predefined trajectory type")
-    traj_group.add_argument("--trajectory_file", nargs='+',
-                            help="Path to JSON trajectory file")
+                                     "boom_up", "boom_down", "orbit_left", "orbit_right", "static"], help="Predefined trajectory type")
+    traj_group.add_argument("--trajectory_file", help="Path to JSON trajectory file")
 
-    # Predefined trajectory parameters
-    parser.add_argument("--angle", type=float,
-                        help="Override rotation angle for pan/tilt/orbit")
-    parser.add_argument("--distance", type=float,
-                        help="Override translation distance for move/push/pull/boom")
-    parser.add_argument("--orbit_radius", type=float,
-                        help="Override orbit radius")
-    parser.add_argument("--traj_mode", choices=["relative", "global"], default="relative",
-                        help="Trajectory mode (default: relative)")
-    parser.add_argument("--zoom_ratio", type=float, default=1.0,
-                        help="Zoom factor for zoom_in/zoom_out (default: 1.0)")
+    parser.add_argument("--angle", type=float, help="Override rotation angle for pan/tilt/orbit")
+    parser.add_argument("--distance", type=float, help="Override translation distance for move/push/pull/boom")
+    parser.add_argument("--orbit_radius", type=float, help="Override orbit radius")
+    parser.add_argument("--traj_mode", choices=["relative", "global"], default="relative", help="Trajectory mode")
+    parser.add_argument("--zoom_ratio", type=float, default=1.0, help="Zoom factor for zoom_in/zoom_out")
+    parser.add_argument("--validate_only", action="store_true", help="Only validate trajectory file")
 
-    # Validation only
-    parser.add_argument("--validate_only", action="store_true",
-                        help="Only validate trajectory file, don't run inference")
+    parser.add_argument("--num_iterations", type=int, default=1, help="Number of continuous generative iterations")
 
-    # Input/output
     parser.add_argument("--input_path", help="Input video or image path")
-    parser.add_argument("--output_path", default="outputs/inference.mp4",
-                        help="Output video path (default: outputs/inference.mp4)")
-    parser.add_argument("--prompt", default="A smooth video with complete scene content. Inpaint any missing regions or margins naturally to match the surrounding scene.",
-                        help="Text prompt for generation")
-    parser.add_argument("--negative_prompt", default="",
-                        help="Negative text prompt")
-
-    # Model parameters
-    parser.add_argument("--model_path", default="models",
-                        help="Model directory path (default: models)")
-    parser.add_argument("--reconstructor_path", default="models/NeoVerse/reconstructor.ckpt",
-                        help="Path to reconstructor checkpoint")
-    parser.add_argument("--disable_lora", action="store_true",
-                        help="Skip distilled LoRA loading")
+    parser.add_argument("--output_path", default="outputs/inference.mp4", help="Output video path")
+    parser.add_argument("--prompt", default="A smooth video with complete scene content. Inpaint any missing regions or margins naturally to match the surrounding scene.", help="Text prompt for generation")
+    parser.add_argument("--negative_prompt", default="worst quality, low quality, blurry, pixelated, flickering, morphing, unnatural movement, temporal inconsistency, bad anatomy, deformed, poorly drawn face, poorly drawn hands, extra limbs, bad composition, out of frame, watermark, text, logo, artifacts, noise.", help="Negative text prompt")
+    parser.add_argument("--model_path", default="models", help="Model directory path")
+    parser.add_argument("--reconstructor_path", default="models/NeoVerse/reconstructor.ckpt", help="Path to reconstructor checkpoint")
+    parser.add_argument("--disable_lora", action="store_true", help="Skip distilled LoRA loading")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--num_frames", type=int, default=81,
-                        help="Number of frames (default: 81)")
-
-    # Video loading
-    parser.add_argument("--height", type=int, default=336,
-                        help="Output height (default: 336)")
-    parser.add_argument("--width", type=int, default=560,
-                        help="Output width (default: 560)")
-    parser.add_argument("--resize_mode", choices=["center_crop", "resize"],
-                        default="center_crop",
-                        help="Video resize mode (default: center_crop)")
-
-    # Advanced
-    parser.add_argument("--alpha_threshold", type=float, default=1.0,
-                        help="Alpha mask threshold (0.0-1.0)")
-    parser.add_argument("--static_scene", action="store_true",
-                        help="Enable static scene mode")
-    parser.add_argument("--vis_rendering", action="store_true",
-                        help="Save intermediate rendering visualizations")
-
+    parser.add_argument("--num_frames", type=int, default=81, help="Number of frames")
+    parser.add_argument("--height", type=int, default=336, help="Output height")
+    parser.add_argument("--width", type=int, default=560, help="Output width")
+    parser.add_argument("--resize_mode", choices=["center_crop", "resize"], default="center_crop", help="Video resize mode")
+    parser.add_argument("--alpha_threshold", type=float, default=1.0, help="Alpha mask threshold (0.0-1.0)")
+    parser.add_argument("--static_scene", action="store_true", help="Enable static scene mode")
+    parser.add_argument("--vis_rendering", action="store_true", help="Save intermediate rendering visualizations")
+    parser.add_argument("--low_vram", action="store_true", help="Enable low-VRAM mode")
     return parser.parse_args()
-
 
 def main():
     args = parse_args()
-
-    # --- LoRA / inference params ---
     use_lora = not args.disable_lora
     num_inference_steps = 4 if use_lora else 50
     cfg_scale = 1.0 if use_lora else 5.0
-
     lora_path = os.path.join(
         args.model_path,
         "NeoVerse/loras/Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank64.safetensors"
     ) if use_lora else None
 
-    # --- Validate-only mode ---
     if args.validate_only:
         if args.trajectory_file is None:
             print("Error: --validate_only requires --trajectory_file")
             return 1
-        print(f"Validating trajectory file: {args.trajectory_file}")
-        try:
-            data = CameraTrajectory.validate_json(args.trajectory_file)
-            fmt = "Keyframe operations" if "keyframes" in data else "Direct matrices"
-            count = len(data.get("keyframes", data.get("trajectory", [])))
-            print(f"  Format: {fmt}")
-            print(f"  Entries: {count}")
-            print(f"  Mode: {data.get('mode', 'relative')}")
-            print("Validation passed!")
-            return 0
-        except ValueError as e:
-            print(f"Validation failed: {e}")
-            return 1
+        data = CameraTrajectory.validate_json(args.trajectory_file)
+        return 0
 
-    # --- Normal inference mode ---
-    if args.input_path is None:
-        print("Error: --input_path is required for inference")
-        return 1
+    if args.input_path is None: return 1
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    # Build trajectories list
-    cam_traj_list = []
-    output_paths = []
-    base_output, ext = os.path.splitext(args.output_path)
-
     if args.trajectory:
-        for t_name in args.trajectory:
-            cam_traj = CameraTrajectory.from_predefined(
-                t_name,
-                num_frames=args.num_frames,
-                mode=args.traj_mode,
-                angle=args.angle,
-                distance=args.distance,
-                orbit_radius=args.orbit_radius,
-                zoom_ratio=args.zoom_ratio,
-            )
-            cam_traj_list.append(cam_traj)
-            output_paths.append(f"{base_output}_{t_name}{ext}")
+        cam_traj = CameraTrajectory.from_predefined(
+            args.trajectory, num_frames=args.num_frames, mode=args.traj_mode, angle=args.angle,
+            distance=args.distance, orbit_radius=args.orbit_radius, zoom_ratio=args.zoom_ratio,
+        )
     else:
-        for t_file in args.trajectory_file:
-            cam_traj = CameraTrajectory.from_json(t_file)
-            cam_traj_list.append(cam_traj)
-            # 使用json文件名作为后缀    
-            file_name = os.path.splitext(os.path.basename(t_file))[0]
-            output_paths.append(f"{base_output}_{file_name}{ext}")
+        cam_traj = CameraTrajectory.from_json(args.trajectory_file)
 
-    # Load model
-    print(f"Loading model from {args.model_path}...")
     pipe = WanVideoNeoVersePipeline.from_pretrained(
-        local_model_path=args.model_path,
-        reconstructor_path=args.reconstructor_path,
-        lora_path=lora_path,
-        lora_alpha=1.0,
-        torch_dtype=torch.bfloat16,
+        local_model_path=args.model_path, reconstructor_path=args.reconstructor_path,
+        lora_path=lora_path, lora_alpha=1.0, torch_dtype=torch.bfloat16,
     ).to("cuda")
-    print("Model loaded!")
 
-    # Load video
-    print(f"Loading video from {args.input_path}...")
-    images = load_video(args.input_path, args.num_frames,
-                        resolution=(args.width, args.height),
-                        resize_mode=args.resize_mode,
-                        static_scene=args.static_scene)
+    images = load_video(args.input_path, args.num_frames, resolution=(args.width, args.height),
+                        resize_mode=args.resize_mode, static_scene=args.static_scene)
 
-    # Run inference
     output_path = args.output_path
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
     if args.vis_rendering:
-        # Save rendering visualizations to a folder named after the output (without extension)
         vis_dir = os.path.splitext(output_path)[0]
         os.makedirs(vis_dir, exist_ok=True)
         pipe.save_root = vis_dir
 
-    print(f"Generating with trajectory: {cam_traj.name} (mode={cam_traj.mode})")
-    generate_multiple_videos(
-        pipe=pipe,
-        input_video=images,
-        prompt=args.prompt,
-        negative_prompt=args.negative_prompt,
-        cam_traj_list=cam_traj_list,
-        output_paths=output_paths, # 传入多个保存路径
-        alpha_threshold=args.alpha_threshold,
-        static_flag=args.static_scene,
-        seed=args.seed,
-        cfg_scale=cfg_scale,
-        num_inference_steps=num_inference_steps,
+    generate_video(
+        pipe=pipe, input_video=images, prompt=args.prompt, negative_prompt=args.negative_prompt,
+        cam_traj=cam_traj, output_path=output_path, alpha_threshold=args.alpha_threshold,
+        static_flag=args.static_scene, seed=args.seed, cfg_scale=cfg_scale,
+        num_inference_steps=num_inference_steps, num_iterations=args.num_iterations,
     )
-    print(f"Done! Output saved to: {output_path}")
     return 0
-
 
 if __name__ == "__main__":
     exit(main())
